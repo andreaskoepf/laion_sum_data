@@ -1,0 +1,7 @@
+hf_dataset_key,source_key,target_key,flan_prompt
+wikihow/all,text,headline,Produce an article summary including outlines of each paragraph of the following article: 
+xsum/1.2.1,document,summary,"Given the following news article, summarize the article in one sentence: "
+cnn_dailymail/3.0.0,article,highlights,Produce an article summary of the following news article: 
+samsum,dialogue,summary,Briefly summarize in third person the following conversation: 
+scitldr/AIC,source,target,"Given the following scientific article, provide a TL;DR summary: "
+billsum,text,summary,Summarize the following proposed legislation (bill): 
