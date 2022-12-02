@@ -1,4 +1,5 @@
 from typing import Dict, List
+import math
 import warnings
 import random
 import dataclasses
@@ -11,7 +12,6 @@ import torch.nn as nn
 import torch.optim as optim
 
 from transformers import T5Tokenizer, T5Model, get_linear_schedule_with_warmup
-
 
 
 def first_true_indices(bools, dtype=torch.long):
@@ -136,7 +136,9 @@ class TrainingEntry:
         )
 
 
-def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256, max_batch_size=24):
+def tokenize_entry(
+    xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256, max_batch_size=24
+):
     assert len(xs) > 0
 
     good_summaries = []
@@ -187,10 +189,15 @@ def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512,
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, init_scale=1.0):
         super().__init__()
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
-        self.out_proj = nn.Linear(self.t5.config.d_model, 1)
+        d_model = self.t5.config.d_model
+        reward_head = nn.Linear(d_model, 1)
+        init_std = init_scale / math.sqrt(d_model + 1)
+        torch.nn.init.normal_(reward_head.weight, std=init_std)
+        torch.nn.init.zeros_(reward_head.bias)
+        self.reward_head = reward_head
 
     def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask):
 
@@ -200,15 +207,15 @@ class RewardModel(nn.Module):
 
         last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
         last_token_indices = last_token_indices.clamp_min(0)
-        
+
         # print("last_token_indices", last_token_indices)
         # print("last_hidden_states:", last_hidden_states.shape)
-        
-        batch_size,_,d_model = last_hidden_states.shape
+
+        batch_size, _, d_model = last_hidden_states.shape
         gather_index = last_token_indices.view(batch_size, 1, 1).repeat(1, 1, d_model)
         last_token_hidden_states = torch.gather(last_hidden_states, dim=1, index=gather_index).squeeze(1)
 
-        reward = self.out_proj(last_token_hidden_states)
+        reward = self.reward_head(last_token_hidden_states)
         return reward
 
 
@@ -242,19 +249,21 @@ def main():
 
     device = torch.device("cuda", 1)
 
-    rm = RewardModel(cache_dir=cache_dir)
+    rm = RewardModel(cache_dir=cache_dir, init_scale=0.1)
     rm.to(device)
-    
+
     epochs = 1
     num_training_steps = len(train_ids) * epochs
     num_warmup_steps = 500
     lr = 5e-5
 
     optimizer = optim.AdamW(rm.parameters(), lr=lr)
-    lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
+    )
 
     train_offset = 0
-    for step in range(1, num_training_steps+1):
+    for step in range(1, num_training_steps + 1):
 
         if train_offset >= len(train_ids):
             train_offset = 0
@@ -264,6 +273,7 @@ def main():
 
         # print('batch_size', b.input_ids.shape, b.summary_ids.shape)
 
+        rm.train()
         y = rm.forward(
             input_ids=b.input_ids,
             attention_mask=b.input_mask,
@@ -273,8 +283,8 @@ def main():
 
         # compute loss
         batch_size = y.shape[0]
-        pos = y[:batch_size//2] # first half of inputs
-        neg = y[batch_size//2:]
+        pos = y[: batch_size // 2]  # first half of inputs
+        neg = y[batch_size // 2 :]
 
         loss = -torch.log(torch.sigmoid(pos - neg))
         loss = torch.mean(loss)
@@ -285,7 +295,7 @@ def main():
         lr_scheduler.step()
 
         if step % 100 == 0:
-            print(f'step: {step}; loss: {loss.item():.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}')
+            print(f"step: {step}; loss: {loss.item():.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}")
 
 
 if __name__ == "__main__":
