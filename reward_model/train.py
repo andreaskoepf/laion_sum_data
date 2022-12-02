@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 import warnings
 import random
 import dataclasses
@@ -7,7 +7,11 @@ import json
 from pathlib import Path
 
 import torch
-from transformers import T5Tokenizer, T5Model
+import torch.nn as nn
+import torch.optim as optim
+
+from transformers import T5Tokenizer, T5Model, get_linear_schedule_with_warmup
+
 
 
 def first_true_indices(bools, dtype=torch.long):
@@ -79,7 +83,7 @@ def parse_entry(x, data_class):
     return data_class(**members)
 
 
-def load_dataset(data_dir: Path, val_frac = 1 / 20):
+def load_dataset(data_dir: Path, val_frac=1 / 20):
     json_files = data_dir.glob("batch*.json")
 
     pairs_by_id = {}
@@ -122,8 +126,17 @@ class TrainingEntry:
     summary_ids: torch.Tensor  # outputs, first half are the prefered summaries
     summary_mask: torch.Tensor
 
+    def to(self, device: torch.DeviceObjType):
+        return TrainingEntry(
+            id,
+            self.input_ids.to(device),
+            self.input_mask.to(device),
+            self.summary_ids.to(device),
+            self.summary_mask.to(device),
+        )
 
-def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256):
+
+def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256, max_batch_size=24):
     assert len(xs) > 0
 
     good_summaries = []
@@ -132,10 +145,10 @@ def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512,
     id = xs[0].info.id
     text = xs[0].info.post
 
-    if len(xs) > 64:
-        xs = xs[:64]
+    if len(xs) > max_batch_size:
+        xs = xs[:max_batch_size]
 
-    for i,x in enumerate(xs):
+    for i, x in enumerate(xs):
         assert x.choice >= 0 and x.choice < 2
         if x.info.post != text:
             warnings.warn(f"text mismatch {id}[{i}]")
@@ -173,85 +186,106 @@ def tokenize_entry(xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512,
     )
 
 
+class RewardModel(nn.Module):
+    def __init__(self, cache_dir):
+        super().__init__()
+        self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
+        self.out_proj = nn.Linear(self.t5.config.d_model, 1)
+
+    def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask):
+
+        decoder_input_ids = self.t5._shift_right(decoder_input_ids)
+        outputs = self.t5(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids)
+        last_hidden_states = outputs.last_hidden_state
+
+        last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
+        last_token_indices = last_token_indices.clamp_min(0)
+        
+        # print("last_token_indices", last_token_indices)
+        # print("last_hidden_states:", last_hidden_states.shape)
+        
+        batch_size,_,d_model = last_hidden_states.shape
+        gather_index = last_token_indices.view(batch_size, 1, 1).repeat(1, 1, d_model)
+        last_token_hidden_states = torch.gather(last_hidden_states, dim=1, index=gather_index).squeeze(1)
+
+        reward = self.out_proj(last_token_hidden_states)
+        return reward
+
+
 def main():
     cache_dir = "../../hf_model_cache"
     data_dir = Path("/data/laion/openai_summarize/comparisons/")
-    tokenized_data_fn = 'tokenizer_cache.pth'
+    tokenized_data_fn = "tokenizer_cache.pth"
+
+    tokenized_items: Dict[str, TrainingEntry]
 
     # try to load cached tokenizer results
     if Path(tokenized_data_fn).exists():
-        print(f'found existing tokenized data file: {tokenized_data_fn}')
+        print(f"found existing tokenized data file: {tokenized_data_fn}")
         data = torch.load(tokenized_data_fn)
-        tokenized_items = data['tokenized_items']
-        train_ids = data['train_ids']
-        validation_ids = data['validation_ids']
-        print(f'loaded items: {len(tokenized_items)}; train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)};')
+        tokenized_items = data["tokenized_items"]
+        train_ids = data["train_ids"]
+        validation_ids = data["validation_ids"]
+        print(
+            f"loaded items: {len(tokenized_items)}; train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)};"
+        )
     else:
         pairs_by_id, train_ids, validation_ids = load_dataset(data_dir)
-        print('tokenizing')
+        print("tokenizing")
         tokenizer = T5Tokenizer.from_pretrained("t5-small", cache_dir=cache_dir, model_max_length=512)
         tokenized_items = {id: tokenize_entry(xs, tokenizer=tokenizer) for id, xs in pairs_by_id.items()}
-        data = { 'tokenized_items': tokenized_items, 'train_ids': train_ids, 'validation_ids': validation_ids }
+        data = {"tokenized_items": tokenized_items, "train_ids": train_ids, "validation_ids": validation_ids}
         torch.save(data, tokenized_data_fn)
-        print(f'saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}')
-       
+        print(
+            f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
+        )
+
+    device = torch.device("cuda", 1)
+
+    rm = RewardModel(cache_dir=cache_dir)
+    rm.to(device)
     
+    epochs = 1
+    num_training_steps = len(train_ids) * epochs
+    num_warmup_steps = 500
+    lr = 5e-5
 
-    return
-    
+    optimizer = optim.AdamW(rm.parameters(), lr=lr)
+    lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
-    device = torch.device("cuda", 0)
+    train_offset = 0
+    for step in range(1, num_training_steps+1):
 
-    tokenize_entry(pairs_by_id[train_ids[0]], tokenizer)
+        if train_offset >= len(train_ids):
+            train_offset = 0
+        b = tokenized_items[train_ids[train_offset]]
+        train_offset += 1
+        b = b.to(device)
 
-    return
-    model = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
+        # print('batch_size', b.input_ids.shape, b.summary_ids.shape)
 
-    # model.to(device)
+        y = rm.forward(
+            input_ids=b.input_ids,
+            attention_mask=b.input_mask,
+            decoder_input_ids=b.summary_ids,
+            decoder_attention_mask=b.summary_mask,
+        )
 
-    input_texts = ["Studies have been shown that owning a dog is good for you", "Hallo, wie geht's?"]
+        # compute loss
+        batch_size = y.shape[0]
+        pos = y[:batch_size//2] # first half of inputs
+        neg = y[batch_size//2:]
 
-    input_encoding = tokenizer.batch_encode_plus(
-        input_texts,
-        return_tensors="pt",
-        padding=True,
-        # max_length=50,
-        # pad_to_max_length=True,
-    )
-    input_ids, attention_mask = input_encoding.input_ids, input_encoding.attention_mask
+        loss = -torch.log(torch.sigmoid(pos - neg))
+        loss = torch.mean(loss)
 
-    output_texts = ["Studies show that</s>", "yip, this is the case, very sure...</s>"]
-    output_encoding = tokenizer.batch_encode_plus(
-        output_texts, return_tensors="pt", padding=True
-    )  # max_length=50, pad_to_max_length=True)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
 
-    decoder_input_ids, decoder_attention_mask = output_encoding.input_ids, output_encoding.attention_mask
-    decoder_input_ids = model._shift_right(decoder_input_ids)
-
-    # input_ids = input_ids.to(device)
-    # decoder_input_ids = decoder_input_ids.to(device)
-
-    # forward pass
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids)
-    print(dir(outputs))
-    last_hidden_states = outputs.last_hidden_state
-
-    # get indices of last elements
-    last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
-    last_token_indices = last_token_indices.clamp_min(0)
-    print("last_token_indices", last_token_indices)
-
-    print("last_hidden_states:", last_hidden_states.shape, last_hidden_states.shape)
-    print(attention_mask)
-    print(decoder_attention_mask)
-
-    gather_index = last_token_indices.view(last_token_indices.shape[0], 1, 1).repeat(1, 1, 512)
-    last_token_hidden_states = torch.gather(last_hidden_states, dim=1, index=gather_index)
-    print("last_token_hidden_states", last_token_hidden_states.shape)
-    print("extr0", last_token_hidden_states[0, 0, 0:10])
-    print("extr1", last_token_hidden_states[1, 0, 0:10])
-    print("last_hidden_states0", last_hidden_states[0, 3, 0:10])
-    print("last_hidden_states1", last_hidden_states[1, 13, 0:10])
+        if step % 100 == 0:
+            print(f'step: {step}; loss: {loss.item():.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}')
 
 
 if __name__ == "__main__":
