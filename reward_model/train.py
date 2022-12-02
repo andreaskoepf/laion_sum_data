@@ -1,5 +1,6 @@
 from typing import Dict, List
 import math
+import uuid
 import warnings
 import random
 import dataclasses
@@ -12,6 +13,9 @@ import torch.nn as nn
 import torch.optim as optim
 
 from transformers import T5Tokenizer, T5Model, get_linear_schedule_with_warmup
+
+import wandb
+import argparse
 
 
 def first_true_indices(bools, dtype=torch.long):
@@ -215,9 +219,60 @@ class RewardModel(nn.Module):
         return reward
 
 
+def parse_args() -> argparse.Namespace:
+    # parse bool args correctly, see https://stackoverflow.com/a/43357954
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ("yes", "true", "t", "y", "1"):
+            return True
+        elif v.lower() in ("no", "false", "f", "n", "0"):
+            return False
+        else:
+            raise argparse.ArgumentTypeError("Boolean value expected.")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda", type=str, help="device to use")
+    parser.add_argument("--device_index", default=0, type=int, help="device index")
+    parser.add_argument(
+        "--manual_seed",
+        default=426349901,
+        type=int,
+        help="initialization of pseudo-RNG",
+    )
+    parser.add_argument("--warmup", default=500, type=int)
+    parser.add_argument("--lr", default=5e-5, type=float)
+    parser.add_argument("--epochs", default=5, type=int)
+    parser.add_argument("--wandb", default=False, action="store_true")
+    parser.add_argument("--project", default="reward_model", type=str, help="project name for wandb")
+    parser.add_argument(
+        "--name",
+        default="rm_" + uuid.uuid4().hex,
+        type=str,
+        help="wandb experiment name",
+    )
+    return parser.parse_args()
+
+
 def main():
+    print(f"Using pytorch version {torch.__version__}")
+    args = parse_args()
+
+    print("Effective args:", args)
+
+    torch.manual_seed(args.manual_seed)
+    device = torch.device(args.device, args.device_index)
+
+    if args.wandb:
+        wandb_mode = "online"
+        wandb.login()
+    else:
+        wandb_mode = "disabled"
+    wandb.init(project=args.project, config=vars(args), mode=wandb_mode, name=args.name)
+
     cache_dir = "../../hf_model_cache"
-    data_dir = Path("/data/laion/openai_summarize/comparisons/")
+    # data_dir = Path("/data/laion/openai_summarize/comparisons/")
+    data_dir = Path("../../openai_summarize_from_feedback/comparisons/")
     tokenized_data_fn = "tokenizer_cache.pth"
 
     tokenized_items: Dict[str, TrainingEntry]
@@ -243,16 +298,14 @@ def main():
             f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
         )
 
-    device = torch.device("cuda", 1)
-
     rm = RewardModel(cache_dir=cache_dir, init_scale=0.7)
     rm.to(device)
 
-    epochs = 3
+    epochs = args.epochs
     num_training_steps = len(train_ids) * epochs
-    num_warmup_steps = 500
-    lr = 5e-5
-    max_batch_size = 20
+    num_warmup_steps = args.warmup
+    lr = args.lr
+    max_batch_size = 64
 
     optimizer = optim.AdamW(rm.parameters(), lr=lr)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -260,6 +313,7 @@ def main():
     )
 
     train_offset = 0
+    loss_acc = []
     for step in range(1, num_training_steps + 1):
 
         if train_offset >= len(train_ids):
@@ -289,16 +343,25 @@ def main():
             pos = y[::2]  # even: good summaries
             neg = y[1::2]  # odd: bad summaries
 
-            loss = -torch.log(torch.sigmoid(pos - neg))
-            loss = torch.mean(loss)
-
+            loss = torch.mean(-torch.log(torch.sigmoid(pos - neg)))
             loss.backward()
+            loss_acc.append(loss.item())
 
         optimizer.step()
         lr_scheduler.step()
 
         if step % 100 == 0:
-            print(f"step: {step}; loss: {loss.item():.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}")
+            mean_loss = sum(loss_acc) / len(loss_acc)
+            print(f"step: {step}; loss: {mean_loss:.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}")
+            loss_acc.clear()
+
+            wandb.log(
+                {
+                    "train.loss": mean_loss,
+                    "train.lr": lr_scheduler.get_last_lr()[0],
+                },
+                step=step,
+            )
 
 
 if __name__ == "__main__":
