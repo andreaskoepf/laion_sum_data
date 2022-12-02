@@ -137,12 +137,11 @@ class TrainingEntry:
 
 
 def tokenize_entry(
-    xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256, max_batch_size=24
+    xs: List[Entry], tokenizer: T5Tokenizer, max_text_length=512, max_summary_length=256, max_batch_size=64
 ):
     assert len(xs) > 0
 
-    good_summaries = []
-    bad_summaries = []
+    summaries = []  # good/bad summaries alternating (even indices are good, odd bad)
 
     id = xs[0].info.id
     text = xs[0].info.post
@@ -158,11 +157,8 @@ def tokenize_entry(
         good_summary = x.summaries[x.choice].text
         bad_summary = x.summaries[1 - x.choice].text
 
-        good_summaries.append(good_summary)
-        bad_summaries.append(bad_summary)
-
-    total_summaries = list(good_summaries)
-    total_summaries.extend(bad_summaries)
+        summaries.append(good_summary)
+        summaries.append(bad_summary)
 
     text_encoding = tokenizer.encode_plus(
         "Summarize: " + text,
@@ -172,7 +168,7 @@ def tokenize_entry(
     )
 
     summary_encoding = tokenizer.batch_encode_plus(
-        total_summaries,
+        summaries,
         return_tensors="pt",
         padding=True,
         max_length=max_summary_length,
@@ -181,15 +177,15 @@ def tokenize_entry(
 
     return TrainingEntry(
         id=id,
-        input_ids=text_encoding.input_ids.repeat(len(total_summaries), 1),
-        input_mask=text_encoding.attention_mask.repeat(len(total_summaries), 1),
+        input_ids=text_encoding.input_ids.repeat(len(summaries), 1),
+        input_mask=text_encoding.attention_mask.repeat(len(summaries), 1),
         summary_ids=summary_encoding.input_ids,
         summary_mask=summary_encoding.attention_mask,
     )
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=1.0):
+    def __init__(self, cache_dir, init_scale=0.7):
         super().__init__()
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
         d_model = self.t5.config.d_model
@@ -249,13 +245,14 @@ def main():
 
     device = torch.device("cuda", 1)
 
-    rm = RewardModel(cache_dir=cache_dir, init_scale=0.1)
+    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7)
     rm.to(device)
 
-    epochs = 1
+    epochs = 3
     num_training_steps = len(train_ids) * epochs
     num_warmup_steps = 500
     lr = 5e-5
+    max_batch_size = 20
 
     optimizer = optim.AdamW(rm.parameters(), lr=lr)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -274,23 +271,29 @@ def main():
         # print('batch_size', b.input_ids.shape, b.summary_ids.shape)
 
         rm.train()
-        y = rm.forward(
-            input_ids=b.input_ids,
-            attention_mask=b.input_mask,
-            decoder_input_ids=b.summary_ids,
-            decoder_attention_mask=b.summary_mask,
-        )
 
-        # compute loss
-        batch_size = y.shape[0]
-        pos = y[: batch_size // 2]  # first half of inputs
-        neg = y[batch_size // 2 :]
-
-        loss = -torch.log(torch.sigmoid(pos - neg))
-        loss = torch.mean(loss)
+        batch_size = b.input_ids.shape[0]
 
         optimizer.zero_grad()
-        loss.backward()
+        assert max_batch_size % 2 == 0
+        for s in range(0, batch_size, max_batch_size):
+            e = s + max_batch_size
+            y = rm.forward(
+                input_ids=b.input_ids[s:e],
+                attention_mask=b.input_mask[s:e],
+                decoder_input_ids=b.summary_ids[s:e],
+                decoder_attention_mask=b.summary_mask[s:e],
+            )
+
+            # compute loss
+            pos = y[::2]  # even: good summaries
+            neg = y[1::2]  # odd: bad summaries
+
+            loss = -torch.log(torch.sigmoid(pos - neg))
+            loss = torch.mean(loss)
+
+            loss.backward()
+
         optimizer.step()
         lr_scheduler.step()
 
