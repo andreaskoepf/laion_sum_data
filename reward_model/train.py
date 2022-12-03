@@ -188,9 +188,17 @@ def tokenize_entry(
     )
 
 
+def mean_pooling(token_embeddings, mask):
+    token_embeddings = token_embeddings.masked_fill(~mask[..., None].bool(), 0.)
+    sentence_embeddings = token_embeddings.sum(dim=1) / mask.sum(dim=1)[..., None]
+    return sentence_embeddings
+
+
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=0.7):
+    def __init__(self, cache_dir, init_scale=0.7, pool='last'):
         super().__init__()
+        assert pool in ('last', 'mean'),'pool type must be either last (hidden states of last tokens) or mean (mean pooling)'
+
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
         d_model = self.t5.config.d_model
         reward_head = nn.Linear(d_model, 1)
@@ -198,6 +206,7 @@ class RewardModel(nn.Module):
         torch.nn.init.normal_(reward_head.weight, std=init_std)
         torch.nn.init.zeros_(reward_head.bias)
         self.reward_head = reward_head
+        self.pool = pool
 
     def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask):
 
@@ -205,17 +214,16 @@ class RewardModel(nn.Module):
         outputs = self.t5(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids)
         last_hidden_states = outputs.last_hidden_state
 
-        last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
-        last_token_indices = last_token_indices.clamp_min(0)
+        if self.pool == 'last':
+            last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
+            last_token_indices = last_token_indices.clamp_min(0)
+            batch_size, _, d_model = last_hidden_states.shape
+            gather_index = last_token_indices.view(batch_size, 1, 1).repeat(1, 1, d_model)
+            x = torch.gather(last_hidden_states, dim=1, index=gather_index).squeeze(1)
+        else:
+            x = mean_pooling(last_hidden_states, decoder_attention_mask)
 
-        # print("last_token_indices", last_token_indices)
-        # print("last_hidden_states:", last_hidden_states.shape)
-
-        batch_size, _, d_model = last_hidden_states.shape
-        gather_index = last_token_indices.view(batch_size, 1, 1).repeat(1, 1, d_model)
-        last_token_hidden_states = torch.gather(last_hidden_states, dim=1, index=gather_index).squeeze(1)
-
-        reward = self.reward_head(last_token_hidden_states)
+        reward = self.reward_head(x)
         return reward
 
 
@@ -241,7 +249,7 @@ def parse_args() -> argparse.Namespace:
         help="initialization of pseudo-RNG",
     )
     parser.add_argument("--warmup", default=500, type=int)
-    parser.add_argument("--lr", default=5e-5, type=float)
+    parser.add_argument("--lr", default=1e-5, type=float)
     parser.add_argument("--epochs", default=5, type=int)
     parser.add_argument("--wandb", default=False, action="store_true")
     parser.add_argument("--project", default="reward_model", type=str, help="project name for wandb")
@@ -251,6 +259,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="wandb experiment name",
     )
+    parser.add_argument('--pool', default='last', type=str, help="pool type: 'last' or 'mean'")
     return parser.parse_args()
 
 
@@ -298,7 +307,7 @@ def main():
             f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
         )
 
-    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7)
+    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool)
     rm.to(device)
 
     epochs = args.epochs
@@ -307,7 +316,7 @@ def main():
     lr = args.lr
     max_batch_size = 64
 
-    optimizer = optim.AdamW(rm.parameters(), lr=lr)
+    optimizer = optim.Adam(rm.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps
     )
