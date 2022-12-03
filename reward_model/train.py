@@ -104,7 +104,7 @@ def load_dataset(data_dir: Path, val_frac=1 / 20):
             else:
                 pairs_by_id[id] = [item]
 
-    ids = list(pairs_by_id.keys())
+    ids: List[str] = list(pairs_by_id.keys())
     assert len(ids) > 100
 
     # split into train & val set
@@ -189,15 +189,18 @@ def tokenize_entry(
 
 
 def mean_pooling(token_embeddings, mask):
-    token_embeddings = token_embeddings.masked_fill(~mask[..., None].bool(), 0.)
+    token_embeddings = token_embeddings.masked_fill(~mask[..., None].bool(), 0.0)
     sentence_embeddings = token_embeddings.sum(dim=1) / mask.sum(dim=1)[..., None]
     return sentence_embeddings
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=0.7, pool='last'):
+    def __init__(self, cache_dir, init_scale=0.7, pool="last"):
         super().__init__()
-        assert pool in ('last', 'mean'),'pool type must be either last (hidden states of last tokens) or mean (mean pooling)'
+        assert pool in (
+            "last",
+            "mean",
+        ), "pool type must be either last (hidden states of last tokens) or mean (mean pooling)"
 
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
         d_model = self.t5.config.d_model
@@ -214,7 +217,7 @@ class RewardModel(nn.Module):
         outputs = self.t5(input_ids=input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids)
         last_hidden_states = outputs.last_hidden_state
 
-        if self.pool == 'last':
+        if self.pool == "last":
             last_token_indices = first_true_indices(decoder_attention_mask == 0) - 1
             last_token_indices = last_token_indices.clamp_min(0)
             batch_size, _, d_model = last_hidden_states.shape
@@ -225,6 +228,51 @@ class RewardModel(nn.Module):
 
         reward = self.reward_head(x)
         return reward
+
+
+@torch.no_grad()
+def validate(
+    rm: RewardModel,
+    device: torch.DeviceObjType,
+    tokenized_items: Dict[str, TrainingEntry],
+    val_ids: List[str],
+    max_batch_size=64,
+):
+    assert max_batch_size % 2 == 0
+
+    loss_acc = []
+    num_acc_examples = 0
+    num_correct_examples = 0
+
+    rm.eval()
+    for id in val_ids:
+        b = tokenized_items[id]
+        b = b.to(device)
+        batch_size = b.input_ids.shape[0]
+
+        for s in range(0, batch_size, max_batch_size):
+            e = s + max_batch_size
+            y = rm.forward(
+                input_ids=b.input_ids[s:e],
+                attention_mask=b.input_mask[s:e],
+                decoder_input_ids=b.summary_ids[s:e],
+                decoder_attention_mask=b.summary_mask[s:e],
+            )
+
+            # compute loss
+            pos = y[::2]  # even: good summaries
+            neg = y[1::2]  # odd: bad summaries
+
+            loss = torch.mean(-torch.log(torch.sigmoid(pos - neg)))
+            loss_acc.append(loss.item())
+
+            num_acc_examples += pos.shape[0]
+            num_correct_examples += torch.count_nonzero(pos > neg).item()
+
+    mean_loss = sum(loss_acc) / len(loss_acc)
+    accuracy = num_correct_examples / num_acc_examples
+
+    return mean_loss, accuracy
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,7 +307,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="wandb experiment name",
     )
-    parser.add_argument('--pool', default='last', type=str, help="pool type: 'last' or 'mean'")
+    parser.add_argument("--pool", default="last", type=str, help="pool type: 'last' or 'mean'")
+    parser.add_argument("--eval_interval", default=2000, type=int)
     return parser.parse_args()
 
 
@@ -315,6 +364,7 @@ def main():
     num_warmup_steps = args.warmup
     lr = args.lr
     max_batch_size = 64
+    eval_interval = args.eval_interval
 
     optimizer = optim.Adam(rm.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -323,7 +373,13 @@ def main():
 
     train_offset = 0
     loss_acc = []
+    num_acc_examples = 0
+    num_correct_examples = 0
     for step in range(1, num_training_steps + 1):
+        if step % eval_interval == 0:
+            val_loss, val_acc = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
+            print(f"[val] step: {step}; loss: {val_loss:.4f}; acc: {val_acc:.2%};")
+            wandb.log({"val.loss": val_loss, "val.acc": val_acc}, step=step)
 
         if train_offset >= len(train_ids):
             train_offset = 0
@@ -356,17 +412,24 @@ def main():
             loss.backward()
             loss_acc.append(loss.item())
 
+            num_acc_examples += pos.shape[0]
+            num_correct_examples += torch.count_nonzero(pos > neg).item()
+
         optimizer.step()
         lr_scheduler.step()
 
         if step % 100 == 0:
-            mean_loss = sum(loss_acc) / len(loss_acc)
-            print(f"step: {step}; loss: {mean_loss:.4f}; lr: {lr_scheduler.get_last_lr()[0]:.4e}")
+            train_mean_loss = sum(loss_acc) / len(loss_acc)
+            train_accuracy = num_correct_examples / num_acc_examples
+            print(
+                f"[train] step: {step}; loss: {train_mean_loss:.4f}; acc: {train_accuracy:.2%}; lr: {lr_scheduler.get_last_lr()[0]:.4e}; (example rewards pos: {pos[0].item():.4f}; neg: {neg[0].item():.4f})"
+            )
             loss_acc.clear()
 
             wandb.log(
                 {
-                    "train.loss": mean_loss,
+                    "train.loss": train_mean_loss,
+                    "train.acc": train_accuracy,
                     "train.lr": lr_scheduler.get_last_lr()[0],
                 },
                 step=step,
