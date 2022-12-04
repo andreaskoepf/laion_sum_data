@@ -195,7 +195,7 @@ def mean_pooling(token_embeddings, mask):
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=0.7, pool="last"):
+    def __init__(self, cache_dir, init_scale=0.7, pool="last", dropout=0.0):
         super().__init__()
         assert pool in (
             "last",
@@ -204,6 +204,7 @@ class RewardModel(nn.Module):
 
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
         d_model = self.t5.config.d_model
+        self.reward_head_dropout = nn.Dropout(p=dropout)
         reward_head = nn.Linear(d_model, 1)
         init_std = init_scale / math.sqrt(d_model + 1)
         torch.nn.init.normal_(reward_head.weight, std=init_std)
@@ -226,6 +227,7 @@ class RewardModel(nn.Module):
         else:
             x = mean_pooling(last_hidden_states, decoder_attention_mask)
 
+        x = self.reward_head_dropout(x)
         reward = self.reward_head(x)
         return reward
 
@@ -297,7 +299,7 @@ def parse_args() -> argparse.Namespace:
         help="initialization of pseudo-RNG",
     )
     parser.add_argument("--warmup", default=500, type=int)
-    parser.add_argument("--lr", default=1e-5, type=float)
+    parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--epochs", default=5, type=int)
     parser.add_argument("--wandb", default=False, action="store_true")
     parser.add_argument("--project", default="reward_model", type=str, help="project name for wandb")
@@ -309,6 +311,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pool", default="last", type=str, help="pool type: 'last' or 'mean'")
     parser.add_argument("--eval_interval", default=2000, type=int)
+    parser.add_argument("--randomized", default=False, type=str2bool, help="Activate batch randomization")
+    parser.add_argument("--batch_size", default=16, type=int, help="maximum batch size")
+    parser.add_argument("--dropout", default=0, type=float, help="reward head dropout probability")
     return parser.parse_args()
 
 
@@ -356,14 +361,14 @@ def main():
             f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
         )
 
-    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool)
+    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
     rm.to(device)
 
     epochs = args.epochs
     num_training_steps = len(train_ids) * epochs
     num_warmup_steps = args.warmup
     lr = args.lr
-    max_batch_size = 64
+    max_batch_size = args.batch_size
     eval_interval = args.eval_interval
 
     optimizer = optim.Adam(rm.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0)
@@ -375,16 +380,75 @@ def main():
     loss_acc = []
     num_acc_examples = 0
     num_correct_examples = 0
+
+    random_train_order = list()
+    for id in train_ids:
+        items = tokenized_items[id]
+        for i in range(0, items.input_ids.size(0), 2):
+            random_train_order.append((id, i))
+    random.shuffle(random_train_order)
+
+    assert max_batch_size % 2 == 0, 'max_batch_size must be divisible by 2'
     for step in range(1, num_training_steps + 1):
         if step % eval_interval == 0:
             val_loss, val_acc = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
             print(f"[val] step: {step}; loss: {val_loss:.4f}; acc: {val_acc:.2%};")
             wandb.log({"val.loss": val_loss, "val.acc": val_acc}, step=step)
 
-        if train_offset >= len(train_ids):
-            train_offset = 0
-        b = tokenized_items[train_ids[train_offset]]
-        train_offset += 1
+        if args.randomized:
+            # collect max_batch_size random examples
+
+            batch_entries = []
+            for i in range(0, max_batch_size, 2):
+                if train_offset >= len(random_train_order):
+                    random.shuffle(random_train_order)
+                    train_offset = 0
+                    print('| next epoch |')
+                entry_id, si = random_train_order[train_offset]
+                train_offset += 1
+                assert si % 2 == 0
+                entry = tokenized_items[entry_id]
+                batch_entries.append(
+                    (
+                        entry.input_ids[si : si + 2],
+                        entry.input_mask[si : si + 2],
+                        entry.summary_ids[si : si + 2],
+                        entry.summary_mask[si : si + 2],
+                    )
+                )
+            longest_input = max(be[0].size(1) for be in batch_entries)
+            longest_summary = max(be[2].size(1) for be in batch_entries)
+
+            # print('longest_input', longest_input)
+            # print('longest_summary', longest_summary)
+
+            input_ids = torch.zeros(max_batch_size, longest_input, dtype=torch.long)
+            input_mask = torch.zeros(max_batch_size, longest_input, dtype=torch.long)
+            summary_ids = torch.zeros(max_batch_size, longest_summary, dtype=torch.long)
+            summary_mask = torch.zeros(max_batch_size, longest_summary, dtype=torch.long)
+
+            for i, be in enumerate(batch_entries):
+                j = i * 2
+                l = be[0].size(1)
+                input_ids[j : j + 2, :l] = be[0]
+                input_mask[j : j + 2, :l] = be[1]
+                l = be[2].size(1)
+                summary_ids[j : j + 2, :l] = be[2]
+                summary_mask[j : j + 2, :l] = be[3]
+
+            # print('input_mask', input_mask)
+            # print('input_ids', input_ids)
+
+            b = TrainingEntry(
+                id="rnd", input_ids=input_ids, input_mask=input_mask, summary_ids=summary_ids, summary_mask=summary_mask
+            )
+
+        else:
+            if train_offset >= len(train_ids):
+                train_offset = 0
+            b = tokenized_items[train_ids[train_offset]]
+            train_offset += 1
+
         b = b.to(device)
 
         # print('batch_size', b.input_ids.shape, b.summary_ids.shape)
