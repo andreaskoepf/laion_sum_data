@@ -317,6 +317,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def write_checkpoint(epoch, step, model, optimizer, lr_scheduler, name, args):
+    fn = "{}_checkpoint_{:02d}_{:07d}.pth".format(name, epoch, step)
+    print("writing cehckpoint: " + fn)
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+            "args": args,
+        },
+        fn,
+    )
+
+
 def main():
     print(f"Using pytorch version {torch.__version__}")
     args = parse_args()
@@ -389,7 +404,9 @@ def main():
     random.shuffle(random_train_order)
 
     assert max_batch_size % 2 == 0, 'max_batch_size must be divisible by 2'
-    for step in range(1, num_training_steps + 1):
+    epoch = 0
+    step = 0
+    while epoch < epochs:
         if step % eval_interval == 0:
             val_loss, val_acc = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
             print(f"[val] step: {step}; loss: {val_loss:.4f}; acc: {val_acc:.2%};")
@@ -404,6 +421,9 @@ def main():
                     random.shuffle(random_train_order)
                     train_offset = 0
                     print('| next epoch |')
+                    epoch += 1
+                    write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.name, args)
+
                 entry_id, si = random_train_order[train_offset]
                 train_offset += 1
                 assert si % 2 == 0
@@ -446,6 +466,9 @@ def main():
         else:
             if train_offset >= len(train_ids):
                 train_offset = 0
+                print('| next epoch |')
+                epoch += 1
+                write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.name, args)
             b = tokenized_items[train_ids[train_offset]]
             train_offset += 1
 
@@ -472,7 +495,9 @@ def main():
             pos = y[::2]  # even: good summaries
             neg = y[1::2]  # odd: bad summaries
 
-            loss = torch.mean(-torch.log(torch.sigmoid(pos - neg)))
+            #loss = -torch.mean(pos - torch.log(1.0 + torch.exp(pos)) - torch.log(1.0 + torch.exp(neg)))
+            loss = -torch.sigmoid(pos - neg).log().mean()  # = torch.log(1 + torch.exp(neg - pos)).mean()
+
             loss.backward()
             loss_acc.append(loss.item())
 
@@ -498,6 +523,8 @@ def main():
                 },
                 step=step,
             )
+
+        step += 1
 
 
 if __name__ == "__main__":
