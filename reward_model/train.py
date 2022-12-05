@@ -265,7 +265,7 @@ def validate(
             pos = y[::2]  # even: good summaries
             neg = y[1::2]  # odd: bad summaries
 
-            loss = torch.mean(-torch.log(torch.sigmoid(pos - neg)))
+            loss = -torch.mean(torch.log(torch.sigmoid(pos - neg)))
             loss_acc.append(loss.item())
 
             num_acc_examples += pos.shape[0]
@@ -314,22 +314,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--randomized", default=False, type=str2bool, help="Activate batch randomization")
     parser.add_argument("--batch_size", default=16, type=int, help="maximum batch size")
     parser.add_argument("--dropout", default=0, type=float, help="reward head dropout probability")
+    parser.add_argument("--output_dir", default='./checkpoints/', type=str, help='')
     return parser.parse_args()
 
 
-def write_checkpoint(epoch, step, model, optimizer, lr_scheduler, name, args):
-    fn = "{}_checkpoint_{:02d}_{:07d}.pth".format(name, epoch, step)
-    print("writing cehckpoint: " + fn)
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
-            "args": args,
-        },
-        fn,
-    )
+def write_checkpoint(epoch, step, model, optimizer, lr_scheduler, output_dir, name, args):
+    dir_path = Path(output_dir)
+    folder_path = dir_path / '{}_checkpoint_{:02d}_{:07d}'.format(name, epoch, step)
+    print(f'writing cehckpoint: {folder_path}')
+    folder_path.mkdir(parents=True, exist_ok=True)
+
+    torch.save(args, folder_path / 'args.pth')
+    torch.save(model.state_dict(), folder_path / 'model.pth')
+    torch.save(optimizer.state_dict(), folder_path / 'optimizer.pth')
+    torch.save(lr_scheduler.state_dict(), folder_path / 'lr_scheduler.pth')
 
 
 def main():
@@ -422,7 +420,7 @@ def main():
                     train_offset = 0
                     print('| next epoch |')
                     epoch += 1
-                    write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.name, args)
+                    write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.output_dir, args.name, args)
 
                 entry_id, si = random_train_order[train_offset]
                 train_offset += 1
@@ -468,7 +466,7 @@ def main():
                 train_offset = 0
                 print('| next epoch |')
                 epoch += 1
-                write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.name, args)
+                write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.output_dir, args.name, args)
             b = tokenized_items[train_ids[train_offset]]
             train_offset += 1
 
@@ -495,9 +493,11 @@ def main():
             pos = y[::2]  # even: good summaries
             neg = y[1::2]  # odd: bad summaries
 
-            #loss = -torch.mean(pos - torch.log(1.0 + torch.exp(pos)) - torch.log(1.0 + torch.exp(neg)))
-            loss = -torch.sigmoid(pos - neg).log().mean()  # = torch.log(1 + torch.exp(neg - pos)).mean()
+            loss = -torch.log(torch.sigmoid(pos - neg))
+            # equivalent:
+            #loss = torch.log(1 + torch.exp(neg - pos))
 
+            loss = loss.mean()
             loss.backward()
             loss_acc.append(loss.item())
 
