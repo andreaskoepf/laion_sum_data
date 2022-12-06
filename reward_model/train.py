@@ -243,8 +243,11 @@ def validate(
     assert max_batch_size % 2 == 0
 
     loss_acc = []
-    num_acc_examples = 0
+    num_pairs = 0
     num_correct_examples = 0
+
+    reward_sum = 0
+    reward_count = 0
 
     rm.eval()
     for id in val_ids:
@@ -261,6 +264,9 @@ def validate(
                 decoder_attention_mask=b.summary_mask[s:e],
             )
 
+            reward_sum += y.sum().item()
+            reward_count += y.size(0)
+
             # compute loss
             pos = y[::2]  # even: good summaries
             neg = y[1::2]  # odd: bad summaries
@@ -268,13 +274,14 @@ def validate(
             loss = -torch.mean(torch.log(torch.sigmoid(pos - neg)))
             loss_acc.append(loss.item())
 
-            num_acc_examples += pos.shape[0]
+            num_pairs += pos.size(0)
             num_correct_examples += torch.count_nonzero(pos > neg).item()
 
     mean_loss = sum(loss_acc) / len(loss_acc)
-    accuracy = num_correct_examples / num_acc_examples
+    accuracy = num_correct_examples / num_pairs
+    reward_bias = reward_sum / reward_count
 
-    return mean_loss, accuracy
+    return mean_loss, accuracy, reward_bias
 
 
 def parse_args() -> argparse.Namespace:
@@ -300,7 +307,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", default=500, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
-    parser.add_argument("--epochs", default=5, type=int)
+    parser.add_argument("--epochs", default=2, type=int)
     parser.add_argument("--wandb", default=False, action="store_true")
     parser.add_argument("--project", default="reward_model", type=str, help="project name for wandb")
     parser.add_argument(
@@ -314,20 +321,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--randomized", default=False, type=str2bool, help="Activate batch randomization")
     parser.add_argument("--batch_size", default=16, type=int, help="maximum batch size")
     parser.add_argument("--dropout", default=0, type=float, help="reward head dropout probability")
-    parser.add_argument("--output_dir", default='./checkpoints/', type=str, help='')
+    parser.add_argument("--output_dir", default="./checkpoints/", type=str, help="")
     return parser.parse_args()
 
 
 def write_checkpoint(epoch, step, model, optimizer, lr_scheduler, output_dir, name, args):
     dir_path = Path(output_dir)
-    folder_path = dir_path / '{}_checkpoint_{:02d}_{:07d}'.format(name, epoch, step)
-    print(f'writing cehckpoint: {folder_path}')
+    folder_path = dir_path / "{}_checkpoint_{:02d}_{:07d}".format(name, epoch, step)
+    print(f"writing cehckpoint: {folder_path}")
     folder_path.mkdir(parents=True, exist_ok=True)
 
-    torch.save(args, folder_path / 'args.pth')
-    torch.save(model.state_dict(), folder_path / 'model.pth')
-    torch.save(optimizer.state_dict(), folder_path / 'optimizer.pth')
-    torch.save(lr_scheduler.state_dict(), folder_path / 'lr_scheduler.pth')
+    torch.save(args, folder_path / "args.pth")
+    torch.save(model.state_dict(), folder_path / "model.pth")
+    torch.save(optimizer.state_dict(), folder_path / "optimizer.pth")
+    torch.save(lr_scheduler.state_dict(), folder_path / "lr_scheduler.pth")
+
+
+def load_reward_model(chkpt_dir: str, hf_cache_dir: str, device: torch.DeviceObjType):
+    chkpt_dir = Path(chkpt_dir)
+
+    args = torch.load(chkpt_dir / "args.pth")
+    model_data = torch.load(chkpt_dir / "model.pth", map_location=device)
+    rm = RewardModel(cache_dir=hf_cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
+    rm.load_state_dict(model_data)
+    rm.to(device)
+    rm.eval()
+    return rm
 
 
 def main():
@@ -374,6 +393,15 @@ def main():
             f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
         )
 
+    """
+    # determine model bias on all validation set entries
+    rm = load_reward_model(
+        "./checkpoints/rnd_b48_mean_do25_checkpoint_01_0006772", hf_cache_dir=cache_dir, device=device
+    )
+    mean_loss, accuracy, reward_bias = validate(rm, device, tokenized_items, validation_ids)
+    print(f"mean_loss: {mean_loss:.4f}; accuracy: {accuracy:.2%}; reward_bias: {reward_bias};")
+    """
+
     rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
     rm.to(device)
 
@@ -401,12 +429,12 @@ def main():
             random_train_order.append((id, i))
     random.shuffle(random_train_order)
 
-    assert max_batch_size % 2 == 0, 'max_batch_size must be divisible by 2'
+    assert max_batch_size % 2 == 0, "max_batch_size must be divisible by 2"
     epoch = 0
     step = 0
     while epoch < epochs:
         if step % eval_interval == 0:
-            val_loss, val_acc = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
+            val_loss, val_acc, reward_bias = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
             print(f"[val] step: {step}; loss: {val_loss:.4f}; acc: {val_acc:.2%};")
             wandb.log({"val.loss": val_loss, "val.acc": val_acc}, step=step)
 
@@ -418,7 +446,7 @@ def main():
                 if train_offset >= len(random_train_order):
                     random.shuffle(random_train_order)
                     train_offset = 0
-                    print('| next epoch |')
+                    print("| next epoch |")
                     epoch += 1
                     write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.output_dir, args.name, args)
 
@@ -464,7 +492,7 @@ def main():
         else:
             if train_offset >= len(train_ids):
                 train_offset = 0
-                print('| next epoch |')
+                print("| next epoch |")
                 epoch += 1
                 write_checkpoint(epoch, step, rm, optimizer, lr_scheduler, args.output_dir, args.name, args)
             b = tokenized_items[train_ids[train_offset]]
@@ -495,7 +523,7 @@ def main():
 
             loss = -torch.log(torch.sigmoid(pos - neg))
             # equivalent:
-            #loss = torch.log(1 + torch.exp(neg - pos))
+            # loss = torch.log(1 + torch.exp(neg - pos))
 
             loss = loss.mean()
             loss.backward()
