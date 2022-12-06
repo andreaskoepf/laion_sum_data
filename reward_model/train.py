@@ -195,7 +195,7 @@ def mean_pooling(token_embeddings, mask):
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=0.7, pool="last", dropout=0.0):
+    def __init__(self, cache_dir, init_scale=0.7, pool="last", dropout=0.0, model_max_length=512):
         super().__init__()
         assert pool in (
             "last",
@@ -203,6 +203,7 @@ class RewardModel(nn.Module):
         ), "pool type must be either last (hidden states of last tokens) or mean (mean pooling)"
 
         self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
+        self.tokenizer = T5Tokenizer.from_pretrained("t5-small", cache_dir=cache_dir, model_max_length=model_max_length)
         d_model = self.t5.config.d_model
         self.reward_head_dropout = nn.Dropout(p=dropout)
         reward_head = nn.Linear(d_model, 1)
@@ -337,12 +338,11 @@ def write_checkpoint(epoch, step, model, optimizer, lr_scheduler, output_dir, na
     torch.save(lr_scheduler.state_dict(), folder_path / "lr_scheduler.pth")
 
 
-def load_reward_model(chkpt_dir: str, hf_cache_dir: str, device: torch.DeviceObjType):
+def load_reward_model(chkpt_dir: str, hf_cache_dir: str, device: torch.DeviceObjType, model_max_length: int=512):
     chkpt_dir = Path(chkpt_dir)
-
     args = torch.load(chkpt_dir / "args.pth")
     model_data = torch.load(chkpt_dir / "model.pth", map_location=device)
-    rm = RewardModel(cache_dir=hf_cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
+    rm = RewardModel(cache_dir=hf_cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout, model_max_length=model_max_length)
     rm.load_state_dict(model_data)
     rm.to(device)
     rm.eval()
@@ -393,14 +393,14 @@ def main():
             f"saved {len(tokenized_items)} (train_ids: {len(train_ids)}; validation_ids: {len(validation_ids)}) to: {tokenized_data_fn}"
         )
 
-    """
-    # determine model bias on all validation set entries
-    rm = load_reward_model(
-        "./checkpoints/rnd_b48_mean_do25_checkpoint_01_0006772", hf_cache_dir=cache_dir, device=device
-    )
-    mean_loss, accuracy, reward_bias = validate(rm, device, tokenized_items, validation_ids)
-    print(f"mean_loss: {mean_loss:.4f}; accuracy: {accuracy:.2%}; reward_bias: {reward_bias};")
-    """
+    if False:
+        # determine model bias on all validation set entries
+        rm = load_reward_model(
+            "./checkpoints/rnd_b48_last_do25_checkpoint_01_0006772", hf_cache_dir=cache_dir, device=device, bias=0.28119512479220826
+        )
+        mean_loss, accuracy, reward_bias = validate(rm, device, tokenized_items, validation_ids)
+        print(f"mean_loss: {mean_loss:.4f}; accuracy: {accuracy:.2%}; reward_bias: {reward_bias};")
+        quit()
 
     rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
     rm.to(device)
