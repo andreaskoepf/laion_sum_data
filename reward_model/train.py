@@ -195,15 +195,15 @@ def mean_pooling(token_embeddings, mask):
 
 
 class RewardModel(nn.Module):
-    def __init__(self, cache_dir, init_scale=0.7, pool="last", dropout=0.0, model_max_length=512):
+    def __init__(self, cache_dir, init_scale: float=0.7, pool:str = "last", base_t5_model_name: str='t5-small', dropout: float=0.0, model_max_length: int=512):
         super().__init__()
         assert pool in (
             "last",
             "mean",
         ), "pool type must be either last (hidden states of last tokens) or mean (mean pooling)"
 
-        self.t5 = T5Model.from_pretrained("t5-small", cache_dir=cache_dir)
-        self.tokenizer = T5Tokenizer.from_pretrained("t5-small", cache_dir=cache_dir, model_max_length=model_max_length)
+        self.t5 = T5Model.from_pretrained(base_t5_model_name, cache_dir=cache_dir)
+        self.tokenizer = T5Tokenizer.from_pretrained(base_t5_model_name, cache_dir=cache_dir, model_max_length=model_max_length)
         d_model = self.t5.config.d_model
         self.reward_head_dropout = nn.Dropout(p=dropout)
         reward_head = nn.Linear(d_model, 1)
@@ -323,6 +323,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", default=16, type=int, help="maximum batch size")
     parser.add_argument("--dropout", default=0, type=float, help="reward head dropout probability")
     parser.add_argument("--output_dir", default="./checkpoints/", type=str, help="")
+    parser.add_argument("--t5_model", default='t5-small', type=str, help="t5-small, t5-base, t5-large, t5-3b, t5-11b")
+    """
+    T5-Small:  60 million parameters
+    T5-Base:  220 million parameters
+    T5-Large: 770 million parameters
+    T5-3B:      3 billion parameters
+    T5-11B:    11 billion parameters
+    """
     return parser.parse_args()
 
 
@@ -342,7 +350,8 @@ def load_reward_model(chkpt_dir: str, hf_cache_dir: str, device: torch.DeviceObj
     chkpt_dir = Path(chkpt_dir)
     args = torch.load(chkpt_dir / "args.pth")
     model_data = torch.load(chkpt_dir / "model.pth", map_location=device)
-    rm = RewardModel(cache_dir=hf_cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout, model_max_length=model_max_length)
+    base_t5_model_name = 't5-small' if 't5_model' not in args else args.t5_model    # allow loading first 
+    rm = RewardModel(cache_dir=hf_cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout, model_max_length=model_max_length, base_t5_model_name=args.t5_model)
     rm.load_state_dict(model_data)
     rm.to(device)
     rm.eval()
@@ -368,7 +377,8 @@ def main():
     cache_dir = "../../hf_model_cache"
     # data_dir = Path("/data/laion/openai_summarize/comparisons/")
     data_dir = Path("../../openai_summarize_from_feedback/comparisons/")
-    tokenized_data_fn = "tokenizer_cache.pth"
+    
+    tokenized_data_fn = f"tokenizer_cache_{args.t5_model}.pth"
 
     tokenized_items: Dict[str, TrainingEntry]
 
@@ -385,7 +395,7 @@ def main():
     else:
         pairs_by_id, train_ids, validation_ids = load_dataset(data_dir)
         print("tokenizing")
-        tokenizer = T5Tokenizer.from_pretrained("t5-small", cache_dir=cache_dir, model_max_length=512)
+        tokenizer = T5Tokenizer.from_pretrained(args.t5_model, cache_dir=cache_dir, model_max_length=512)
         tokenized_items = {id: tokenize_entry(xs, tokenizer=tokenizer) for id, xs in pairs_by_id.items()}
         data = {"tokenized_items": tokenized_items, "train_ids": train_ids, "validation_ids": validation_ids}
         torch.save(data, tokenized_data_fn)
@@ -401,9 +411,11 @@ def main():
         mean_loss, accuracy, reward_bias = validate(rm, device, tokenized_items, validation_ids)
         print(f"mean_loss: {mean_loss:.4f}; accuracy: {accuracy:.2%}; reward_bias: {reward_bias};")
         quit()
-
-    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool, dropout=args.dropout)
+ 
+    print(f'creating reward model based on {args.t5_model}...')
+    rm = RewardModel(cache_dir=cache_dir, init_scale=0.7, pool=args.pool, base_t5_model_name=args.t5_model, dropout=args.dropout)
     rm.to(device)
+    print('ok')
 
     epochs = args.epochs
     num_training_steps = len(train_ids) * epochs
@@ -433,7 +445,7 @@ def main():
     epoch = 0
     step = 0
     while epoch < epochs:
-        if step % eval_interval == 0:
+        if step % eval_interval == 0 and step > 0:
             val_loss, val_acc, reward_bias = validate(rm, device, tokenized_items, validation_ids, max_batch_size)
             print(f"[val] step: {step}; loss: {val_loss:.4f}; acc: {val_acc:.2%};")
             wandb.log({"val.loss": val_loss, "val.acc": val_acc}, step=step)
